@@ -1,6 +1,8 @@
-import argparse
 import pandas as pd
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+import argparse
+import os as _os # Keep os import for the config setup
+# ... (rest of imports and constants remain the same)
 
 DECISION_ACCEPTED = "ACCEPTED"
 DECISION_IN_REVIEW = "IN_REVIEW"
@@ -34,7 +36,6 @@ DEFAULT_CONFIG = {
 
 # Optional: override thresholds via environment variables (for CI/CD / canary tuning)
 try:
-    import os as _os
     _rej = _os.getenv("REJECT_AT")
     _rev = _os.getenv("REVIEW_AT")
     if _rej is not None:
@@ -44,6 +45,7 @@ try:
 except Exception:
     pass
 
+# --- Helper functions (no change) ---
 def is_night(hour: int) -> bool:
     return hour >= 22 or hour <= 5
 
@@ -55,74 +57,112 @@ def add_reputation_reason(reasons: List[str], rep: str, rep_add: int) -> None:
     sign = "+" if rep_add > 0 else "-"
     reasons.append(f"user_reputation:{rep}{sign}")
 
+# --- NEW Helper functions to reduce complexity in assess_row ---
+
+def check_hard_block(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Checks for the hard block condition."""
+    return (
+        int(row.get("chargeback_count", 0)) >= cfg["chargeback_hard_block"] and
+        str(row.get("ip_risk", "low")).lower() == "high"
+    )
+
+def score_and_reason_categorical(row: pd.Series, field: str, mapping: Dict[str, Any], reasons: List[str]) -> int:
+    """Calculates score and adds reason for a single categorical risk."""
+    val = str(row.get(field, "low")).lower()
+    add = mapping.get(val, 0)
+    if add:
+        reasons.append(f"{field}:{val}(+{add})")
+    return add
+
+def score_time_and_geo(row: pd.Series, cfg: Dict[str, Any], reasons: List[str]) -> int:
+    """Scores night hour and geo mismatch risks."""
+    total_add = 0
+    # Night hour
+    hr = int(row.get("hour", 12))
+    if is_night(hr):
+        add = cfg["score_weights"]["night_hour"]
+        total_add += add
+        reasons.append(f"night_hour:{hr}(+{add})")
+
+    # Geo mismatch
+    bin_c = str(row.get("bin_country", "")).upper()
+    ip_c = str(row.get("ip_country", "")).upper()
+    if bin_c and ip_c and bin_c != ip_c:
+        add = cfg["score_weights"]["geo_mismatch"]
+        total_add += add
+        reasons.append(f"geo_mismatch:{bin_c}!={ip_c}(+{add})")
+        
+    return total_add
+
+def score_amount_risks(row: pd.Series, cfg: Dict[str, Any], rep: str, reasons: List[str]) -> int:
+    """Scores high amount and new user high amount risks."""
+    total_add = 0
+    amount = float(row.get("amount_mxn", 0.0))
+    ptype = str(row.get("product_type", "_default")).lower()
+    
+    if high_amount(amount, ptype, cfg["amount_thresholds"]):
+        add = cfg["score_weights"]["high_amount"]
+        total_add += add
+        reasons.append(f"high_amount:{ptype}:{amount}(+{add})")
+        
+        # Nested check extracted to an independent logic block
+        if rep == "new":
+            add2 = cfg["score_weights"]["new_user_high_amount"]
+            total_add += add2
+            reasons.append(f"new_user_high_amount(+{add2})")
+            
+    return total_add
+
+def apply_frequency_buffer(row: pd.Series, rep: str, current_score: int, reasons: List[str]) -> int:
+    """Applies a score reduction if transaction frequency is high for trusted/recurrent users."""
+    freq = int(row.get("customer_txn_30d", 0))
+    # This whole condition is 1 point of complexity (AND/OR are free, the IF is +1)
+    if rep in ("recurrent", "trusted") and freq >= 3 and current_score > 0:
+        current_score -= 1
+        reasons.append("frequency_buffer(-1)")
+    return current_score
+
+# --- Main Refactored Function ---
+
 def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
     score = 0
     reasons: List[str] = []
 
-    # Hard block: repeated chargebacks + high IP risk
-    if int(row.get("chargeback_count", 0)) >= cfg["chargeback_hard_block"] and str(row.get("ip_risk", "low")).lower() == "high":
+    # Hard block check
+    if check_hard_block(row, cfg):
         reasons.append("hard_block:chargebacks>=2+ip_high")
         return {"decision": DECISION_REJECTED, "risk_score": 100, "reasons": ";".join(reasons)}
 
-    # Categorical risks
+    # Categorical risks (Complexity of FOR loop is 1, Complexity of helper function call is 0)
     for field, mapping in [("ip_risk", cfg["score_weights"]["ip_risk"]),
                            ("email_risk", cfg["score_weights"]["email_risk"]),
                            ("device_fingerprint_risk", cfg["score_weights"]["device_fingerprint_risk"])]:
-        val = str(row.get(field, "low")).lower()
-        add = mapping.get(val, 0)
-        score += add
-        if add:
-            reasons.append(f"{field}:{val}(+{add})")
+        score += score_and_reason_categorical(row, field, mapping, reasons)
 
     # Reputation
     rep = str(row.get("user_reputation", "new")).lower()
     rep_add = cfg["score_weights"]["user_reputation"].get(rep, 0)
     score += rep_add
-    if rep_add != 0:
+    if rep_add != 0: # Complexity of IF is 1
         add_reputation_reason(reasons, rep, rep_add)
 
-
-    # Night hour
-    hr = int(row.get("hour", 12))
-    if is_night(hr):
-        add = cfg["score_weights"]["night_hour"]
-        score += add
-        reasons.append(f"night_hour:{hr}(+{add})")
-
-    # Geo mismatch
-    bin_c = str(row.get("bin_country", "")).upper()
-    ip_c  = str(row.get("ip_country", "")).upper()
-    if bin_c and ip_c and bin_c != ip_c:
-        add = cfg["score_weights"]["geo_mismatch"]
-        score += add
-        reasons.append(f"geo_mismatch:{bin_c}!={ip_c}(+{add})")
-
-    # High amount for product type
-    amount = float(row.get("amount_mxn", 0.0))
-    ptype = str(row.get("product_type", "_default")).lower()
-    if high_amount(amount, ptype, cfg["amount_thresholds"]):
-        add = cfg["score_weights"]["high_amount"]
-        score += add
-        reasons.append(f"high_amount:{ptype}:{amount}(+{add})")
-        if rep == "new":
-            add2 = cfg["score_weights"]["new_user_high_amount"]
-            score += add2
-            reasons.append(f"new_user_high_amount(+{add2})")
+    # Time and Geo Mismatch (Complexity of helper function call is 0)
+    score += score_time_and_geo(row, cfg, reasons)
+    
+    # High Amount Risks (Complexity of helper function call is 0)
+    score += score_amount_risks(row, cfg, rep, reasons)
 
     # Extreme latency
     lat = int(row.get("latency_ms", 0))
-    if lat >= cfg["latency_ms_extreme"]:
+    if lat >= cfg["latency_ms_extreme"]: # Complexity of IF is 1
         add = cfg["score_weights"]["latency_extreme"]
         score += add
         reasons.append(f"latency_extreme:{lat}ms(+{add})")
 
-    # Frequency buffer for trusted/recurrent
-    freq = int(row.get("customer_txn_30d", 0))
-    if rep in ("recurrent", "trusted") and freq >= 3 and score > 0:
-        score -= 1
-        reasons.append("frequency_buffer(-1)")
+    # Frequency buffer (Complexity of helper function call is 0)
+    score = apply_frequency_buffer(row, rep, score, reasons)
 
-    # Decision mapping
+    # Decision mapping (Complexity of IF/ELIF/ELSE is 3)
     if score >= cfg["score_to_decision"]["reject_at"]:
         decision = DECISION_REJECTED
     elif score >= cfg["score_to_decision"]["review_at"]:

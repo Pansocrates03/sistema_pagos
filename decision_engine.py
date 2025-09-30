@@ -51,6 +51,10 @@ def high_amount(amount: float, product_type: str, thresholds: Dict[str, Any]) ->
     t = thresholds.get(product_type, thresholds.get("_default"))
     return amount >= t
 
+def add_reputation_reason(reasons: List[str], rep: str, rep_add: int) -> None:
+    sign = "+" if rep_add > 0 else "-"
+    reasons.append(f"user_reputation:{rep}{sign}")
+
 def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
     score = 0
     reasons: List[str] = []
@@ -75,8 +79,7 @@ def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
     rep_add = cfg["score_weights"]["user_reputation"].get(rep, 0)
     score += rep_add
     if rep_add != 0:
-        sign = "+" if rep_add > 0 else "-"
-        reasons.append(f"user_reputation:{rep}{sign}")
+        add_reputation_reason(reasons, rep, rep_add)
 
 
     # Night hour

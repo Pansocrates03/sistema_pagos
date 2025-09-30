@@ -74,11 +74,9 @@ def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
     rep = str(row.get("user_reputation", "new")).lower()
     rep_add = cfg["score_weights"]["user_reputation"].get(rep, 0)
     score += rep_add
-
-    if rep_add and  rep_add >= 0:
-        reasons.append(f"user_reputation:{rep}+")
-    elif rep_add and rep_add < 0:
-        reasons.append(f"user_reputation:{rep}-") 
+    if rep_add != 0:
+        sign = "+" if rep_add > 0 else "-"
+        reasons.append(f"user_reputation:{rep}{sign}")
 
 
     # Night hour
